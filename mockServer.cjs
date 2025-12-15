@@ -104,6 +104,80 @@ function setupMocks() {
 }
 
 /* ---------------------------------------------
+   Extract endpoint details with methods and parameters
+--------------------------------------------- */
+function extractEndpointDetails(swaggerData) {
+  const endpoints = [];
+  const paths = swaggerData.paths || {};
+
+  for (const path in paths) {
+    const pathItem = paths[path];
+    const methods = ["get", "post", "put", "patch", "delete", "options", "head"];
+
+    for (const method of methods) {
+      if (pathItem[method]) {
+        const operation = pathItem[method];
+        const endpoint = {
+          path: path,
+          method: method.toUpperCase(),
+          summary: operation.summary || "",
+          description: operation.description || "",
+          parameters: [],
+          requestBody: null,
+        };
+
+        // Extract parameters (path, query, header, etc.)
+        if (operation.parameters && Array.isArray(operation.parameters)) {
+          endpoint.parameters = operation.parameters.map((param) => {
+            const paramInfo = {
+              name: param.name,
+              in: param.in, // path, query, header, cookie
+              required: param.required || false,
+              description: param.description || "",
+              type: param.schema?.type || "string",
+            };
+
+            // Add schema details if available
+            if (param.schema) {
+              paramInfo.schema = {
+                type: param.schema.type,
+                format: param.schema.format,
+                example: param.schema.example,
+                enum: param.schema.enum,
+                default: param.schema.default,
+              };
+            }
+
+            return paramInfo;
+          });
+        }
+
+        // Extract request body if present
+        if (operation.requestBody) {
+          const content = operation.requestBody.content || {};
+          const contentType = Object.keys(content)[0] || "application/json";
+          const schema = content[contentType]?.schema;
+
+          endpoint.requestBody = {
+            required: operation.requestBody.required || false,
+            description: operation.requestBody.description || "",
+            contentType: contentType,
+            schema: schema ? {
+              type: schema.type,
+              $ref: schema.$ref,
+            } : null,
+          };
+        }
+
+        endpoints.push(endpoint);
+      }
+    }
+  }
+
+  return endpoints;
+}
+
+/* ---------------------------------------------
    Endpoint: Load Swagger URL (called by Flutter panel)
 --------------------------------------------- */
 app.post("/load-swagger", async (req, res) => {
@@ -117,7 +191,7 @@ app.post("/load-swagger", async (req, res) => {
 
     setupMocks();
 
-    const endpoints = Object.keys(swaggerData.paths || {});
+    const endpoints = extractEndpointDetails(swaggerData);
 
     const protocol = req.get("x-forwarded-proto") || req.protocol;
 
@@ -125,7 +199,7 @@ app.post("/load-swagger", async (req, res) => {
 
     return res.json({
       message: "Mock API created successfully",
-      endpoints,
+      endpoints: endpoints,
       mockBaseUrl: baseUrl,
     });
   } catch (err) {
