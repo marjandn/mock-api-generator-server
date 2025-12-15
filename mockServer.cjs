@@ -202,15 +202,23 @@ function extractEndpointDetails(swaggerData) {
           description: operation.description || "",
           operationId: operation.operationId || "",
           tags: operation.tags || [],
-          parameters: [],
+          // Parameters organized by type for clarity
+          parameters: {
+            path: [],
+            query: [],
+            header: [],
+            cookie: [],
+            all: [],
+          },
+          // Request body with full schema and examples
           requestBody: null,
           responses: {},
           security: operation.security || swaggerData.security || [],
         };
 
-        // Extract parameters (path, query, header, cookie)
+        // Extract parameters (path, query, header, cookie) - VERY IMPORTANT FOR CLIENT
         if (operation.parameters && Array.isArray(operation.parameters)) {
-          endpoint.parameters = operation.parameters.map((param) => {
+          operation.parameters.forEach((param) => {
             const paramInfo = {
               name: param.name,
               in: param.in, // path, query, header, cookie
@@ -228,6 +236,11 @@ function extractEndpointDetails(swaggerData) {
               paramInfo.example = param.example || paramInfo.schema?.example || param.schema?.example;
               paramInfo.default = paramInfo.schema?.default || param.schema?.default;
               paramInfo.enum = paramInfo.schema?.enum || param.schema?.enum;
+              paramInfo.minimum = paramInfo.schema?.minimum;
+              paramInfo.maximum = paramInfo.schema?.maximum;
+              paramInfo.minLength = paramInfo.schema?.minLength;
+              paramInfo.maxLength = paramInfo.schema?.maxLength;
+              paramInfo.pattern = paramInfo.schema?.pattern;
             } else {
               paramInfo.type = "string";
             }
@@ -236,36 +249,61 @@ function extractEndpointDetails(swaggerData) {
             if (param.style) paramInfo.style = param.style;
             if (param.explode !== undefined) paramInfo.explode = param.explode;
 
-            return paramInfo;
+            // Organize by parameter location
+            endpoint.parameters.all.push(paramInfo);
+            if (param.in === "path") {
+              endpoint.parameters.path.push(paramInfo);
+            } else if (param.in === "query") {
+              endpoint.parameters.query.push(paramInfo);
+            } else if (param.in === "header") {
+              endpoint.parameters.header.push(paramInfo);
+            } else if (param.in === "cookie") {
+              endpoint.parameters.cookie.push(paramInfo);
+            }
           });
         }
 
-        // Extract request body if present
+        // Extract request body if present - VERY IMPORTANT FOR CLIENT
         if (operation.requestBody) {
           const requestBodyContent = operation.requestBody.content || {};
           const contentTypes = Object.keys(requestBodyContent);
           
-          // Support multiple content types
+          // Support multiple content types with full details
           endpoint.requestBody = {
             required: operation.requestBody.required || false,
             description: operation.requestBody.description || "",
             contentTypes: {},
+            // Generate example request body for easier testing
+            example: null,
           };
 
           for (const contentType of contentTypes) {
             const contentSchema = requestBodyContent[contentType]?.schema;
             if (contentSchema) {
               const resolvedSchema = resolveSchema(contentSchema, schemas);
+              const fullSchema = extractSchemaStructure(resolvedSchema || contentSchema, schemas);
+              
               endpoint.requestBody.contentTypes[contentType] = {
-                schema: extractSchemaStructure(resolvedSchema || contentSchema, schemas),
+                schema: fullSchema,
                 example: requestBodyContent[contentType]?.example,
                 examples: requestBodyContent[contentType]?.examples,
+                // Generate example from schema if no example provided
+                generatedExample: requestBodyContent[contentType]?.example 
+                  ? null 
+                  : generateMockFromSchema(resolvedSchema || contentSchema, schemas),
               };
+
+              // Set primary example (prefer provided example, fallback to generated)
+              if (!endpoint.requestBody.example && contentType === "application/json") {
+                endpoint.requestBody.example = requestBodyContent[contentType]?.example 
+                  || generateMockFromSchema(resolvedSchema || contentSchema, schemas);
+              }
             } else {
               endpoint.requestBody.contentTypes[contentType] = {
                 schema: null,
                 example: requestBodyContent[contentType]?.example,
                 examples: requestBodyContent[contentType]?.examples,
+                generatedExample: null,
               };
             }
           }
@@ -313,6 +351,27 @@ function extractEndpointDetails(swaggerData) {
           }
         }
 
+        // Add summary for quick reference - VERY IMPORTANT FOR CLIENT
+        endpoint.summary = {
+          hasParameters: endpoint.parameters.all.length > 0,
+          hasRequestBody: endpoint.requestBody !== null,
+          parameterCount: {
+            path: endpoint.parameters.path.length,
+            query: endpoint.parameters.query.length,
+            header: endpoint.parameters.header.length,
+            cookie: endpoint.parameters.cookie.length,
+            total: endpoint.parameters.all.length,
+          },
+          requiredParameters: endpoint.parameters.all.filter(p => p.required).map(p => ({
+            name: p.name,
+            in: p.in,
+            type: p.type,
+          })),
+          requestBodyRequired: endpoint.requestBody?.required || false,
+          requestBodyContentTypes: endpoint.requestBody ? Object.keys(endpoint.requestBody.contentTypes) : [],
+          responseStatusCodes: Object.keys(endpoint.responses),
+        };
+
         endpoints.push(endpoint);
       }
     }
@@ -326,6 +385,8 @@ function extractEndpointDetails(swaggerData) {
 --------------------------------------------- */
 app.post("/load-swagger", async (req, res) => {
   const { url } = req.body;
+  const page = parseInt(req.query.page) || parseInt(req.body.page) || 1;
+  const limit = parseInt(req.query.limit) || parseInt(req.body.limit) || 50;
 
   if (!url) return res.status(400).json({ message: "Swagger URL is required" });
 
@@ -335,7 +396,12 @@ app.post("/load-swagger", async (req, res) => {
 
     setupMocks();
 
-    const endpoints = extractEndpointDetails(swaggerData);
+    const allEndpoints = extractEndpointDetails(swaggerData);
+    const totalEndpoints = allEndpoints.length;
+    const totalPages = Math.ceil(totalEndpoints / limit);
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+    const paginatedEndpoints = allEndpoints.slice(startIndex, endIndex);
 
     const protocol = req.get("x-forwarded-proto") || req.protocol;
     const baseUrl = `${protocol}://${req.get("host")}`;
@@ -353,7 +419,15 @@ app.post("/load-swagger", async (req, res) => {
         description: swaggerData.info?.description || "",
         version: swaggerData.info?.version || "",
       },
-      endpoints: endpoints,
+      pagination: {
+        page: page,
+        limit: limit,
+        total: totalEndpoints,
+        totalPages: totalPages,
+        hasNextPage: page < totalPages,
+        hasPreviousPage: page > 1,
+      },
+      endpoints: paginatedEndpoints,
       mockBaseUrl: baseUrl,
       securitySchemes: securitySchemes,
       servers: servers,
@@ -364,6 +438,52 @@ app.post("/load-swagger", async (req, res) => {
       error: err.message,
     });
   }
+});
+
+/* ---------------------------------------------
+   Endpoint: Get all endpoints with pagination
+--------------------------------------------- */
+app.get("/endpoints", (req, res) => {
+  if (!swaggerData || !swaggerData.paths) {
+    return res.status(404).json({
+      message: "No Swagger data loaded. Please call /load-swagger first.",
+    });
+  }
+
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 50;
+  const method = req.query.method ? req.query.method.toUpperCase() : null;
+  const tag = req.query.tag || null;
+
+  let allEndpoints = extractEndpointDetails(swaggerData);
+
+  // Filter by method if provided
+  if (method) {
+    allEndpoints = allEndpoints.filter((ep) => ep.method === method);
+  }
+
+  // Filter by tag if provided
+  if (tag) {
+    allEndpoints = allEndpoints.filter((ep) => ep.tags.includes(tag));
+  }
+
+  const totalEndpoints = allEndpoints.length;
+  const totalPages = Math.ceil(totalEndpoints / limit);
+  const startIndex = (page - 1) * limit;
+  const endIndex = startIndex + limit;
+  const paginatedEndpoints = allEndpoints.slice(startIndex, endIndex);
+
+  return res.json({
+    pagination: {
+      page: page,
+      limit: limit,
+      total: totalEndpoints,
+      totalPages: totalPages,
+      hasNextPage: page < totalPages,
+      hasPreviousPage: page > 1,
+    },
+    endpoints: paginatedEndpoints,
+  });
 });
 
 /* ---------------------------------------------
